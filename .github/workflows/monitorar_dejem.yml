@@ -1,0 +1,175 @@
+name: Monitorar DEJEM PMESP
+
+# Clone do monitorar.yml da Atividade Delegada, rodando como workflow
+# totalmente separado (grupo de concorrência próprio).
+#
+# RISCO AINDA NÃO TESTADO: o site aceita duas sessões de login simultâneas,
+# mas isso não garante que o gateway de VPN aceite dois túneis simultâneos
+# com o mesmo usuário. Só o teste real vai confirmar.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: monitor-dejem-pmesp
+  cancel-in-progress: false
+
+jobs:
+  checar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v7
+
+      # CORREÇÃO 07/10/2026: em vez de fixar um único espelho (que quando cai
+      # trava o apt por ~15min), testa qual responde e limita o tempo de espera.
+      - name: Escolher espelho do apt que esteja respondendo
+        run: |
+          echo 'Acquire::http::Timeout "10"; Acquire::Retries "2";' | sudo tee /etc/apt/apt.conf.d/99rapido
+          COD=$(lsb_release -cs)
+          for m in "http://archive.ubuntu.com/ubuntu" "http://azure.archive.ubuntu.com/ubuntu"; do
+            if curl -fsS -m 8 -o /dev/null "$m/dists/$COD/InRelease"; then
+              echo "✅ Usando $m"
+              echo "$m" | sudo tee /etc/apt/apt-mirrors.txt
+              exit 0
+            fi
+            echo "⚠️ $m não respondeu"
+          done
+          echo "Nenhum respondeu, mantendo o padrão do runner"
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Instalar dependências
+        run: npm install
+
+      # CORREÇÃO 07/10/2026: sem --with-deps. As libs do Chromium já vêm no
+      # runner; só faltavam fontes, que não são necessárias pro scraping.
+      - name: Instalar navegador (Chromium) do Playwright
+        run: npx playwright install chromium
+
+      # CORREÇÃO 07/10/2026: retry, já que o openconnect é o único apt necessário.
+      - name: Instalar cliente VPN (openconnect, compatível com Cisco AnyConnect)
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -y && sudo apt-get install -y openconnect && exit 0
+            echo "Tentativa $i falhou, aguardando..."
+            sleep 15
+          done
+          exit 1
+
+      - name: Conectar na VPN da PMESP
+        timeout-minutes: 3
+        continue-on-error: true
+        id: vpn
+        env:
+          PMESP_VPN_USUARIO: ${{ secrets.PMESP_VPN_USUARIO }}
+          PMESP_VPN_SENHA: ${{ secrets.PMESP_VPN_SENHA }}
+        run: |
+          echo "$PMESP_VPN_SENHA" > /tmp/vpnpass
+          chmod 600 /tmp/vpnpass
+
+          sudo -b openconnect \
+            --background \
+            --pid-file=/tmp/openconnect.pid \
+            --user="$PMESP_VPN_USUARIO" \
+            --authgroup="53 - CPRV" \
+            --passwd-on-stdin \
+            --servercert pin-sha256:ccVM9Z6xyx607/QtUIoHLJcnq5m53m1crfttZ6Y6AhA= \
+            https://extranet.policiamilitar.sp.gov.br/ \
+            < /tmp/vpnpass > /tmp/openconnect.log 2>&1
+          sleep 1
+          rm -f /tmp/vpnpass
+
+          echo "Aguardando o arquivo de PID da VPN aparecer..."
+          ok_pid=""
+          for i in $(seq 1 15); do
+            if sudo test -f /tmp/openconnect.pid; then
+              ok_pid="1"
+              break
+            fi
+            sleep 1
+          done
+          echo "----- log do openconnect -----"
+          sudo cat /tmp/openconnect.log || true
+          echo "-------------------------------"
+          if [ -z "$ok_pid" ]; then
+            echo "❌ VPN não conectou (nenhum arquivo de PID apareceu)."
+            exit 1
+          fi
+          sudo cat /tmp/openconnect.pid
+
+          echo "Aguardando o DNS interno da PMESP responder..."
+          ok=""
+          for i in $(seq 1 20); do
+            if getent hosts intranet.policiamilitar.sp.gov.br > /dev/null 2>&1; then
+              echo "✅ DNS interno respondendo (tentativa $i)."
+              ok="1"
+              break
+            fi
+            sleep 3
+          done
+          if [ -z "$ok" ]; then
+            echo "❌ DNS interno não respondeu depois de esperar — a VPN pode não ter conectado direito."
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ VPN conectada com sucesso — essa etapa já terminou de verdade."
+          echo "ℹ️  Se ela continuar parecendo 'presa' aqui na tela, é só um"
+          echo "    comportamento visual do GitHub — não cancele o workflow."
+
+      - name: Rodar checagem do DEJEM
+        if: steps.vpn.outcome == 'success'
+        env:
+          PMESP_USUARIO: ${{ secrets.PMESP_USUARIO }}
+          PMESP_SENHA: ${{ secrets.PMESP_SENHA }}
+          PMESP_AISP: ${{ vars.PMESP_AISP_DEJEM }}
+          LOGIN_URL: ${{ vars.LOGIN_URL }}
+          URL_TELA_ESCALAS_DEJEM: ${{ vars.URL_TELA_ESCALAS_DEJEM }}
+          TELEGRAM_BOT_TOKEN_DEJEM: ${{ secrets.TELEGRAM_BOT_TOKEN_DEJEM }}
+          TELEGRAM_CHAT_ID_DEJEM: ${{ secrets.TELEGRAM_CHAT_ID_DEJEM }}
+          NODE_ENV: production
+          FORCE_COLOR: "0"
+        continue-on-error: true
+        id: checagem
+        run: stdbuf -oL -eL node monitor_dejem.js
+
+      - name: Registrar falha de VPN (pra poder notificar)
+        if: steps.vpn.outcome == 'failure'
+        run: |
+          echo '{"erro":"A VPN não conseguiu conectar (ou o DNS interno não respondeu a tempo). Provavelmente instabilidade temporária do servidor VPN da PMESP.","novos":[],"resultadoPorArea":[]}' > resultado_dejem.json
+
+      - name: Desconectar da VPN
+        if: always()
+        run: |
+          if sudo test -f /tmp/openconnect.pid; then
+            sudo kill "$(sudo cat /tmp/openconnect.pid)" || true
+          fi
+          sleep 2
+
+      - name: Enviar notificações no Telegram (canal do DEJEM)
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN_DEJEM: ${{ secrets.TELEGRAM_BOT_TOKEN_DEJEM }}
+          TELEGRAM_CHAT_ID_DEJEM: ${{ secrets.TELEGRAM_CHAT_ID_DEJEM }}
+          MODULO_LABEL_DEJEM: ${{ vars.MODULO_LABEL_DEJEM }}
+        run: stdbuf -oL -eL node notificar_dejem.js
+
+      - name: Marcar job como falho (se algo deu errado)
+        if: steps.vpn.outcome == 'failure' || steps.checagem.outcome == 'failure'
+        run: exit 1
+
+      - name: Salvar lista de escalas já avisadas (DEJEM)
+        if: always()
+        run: |
+          git config user.name "monitor-dejem-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add seen_dejem.json || true
+          git diff --cached --quiet || git commit -m "Atualiza escalas do DEJEM já avisadas [skip ci]"
+          git push || true
